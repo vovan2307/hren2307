@@ -1,0 +1,6 @@
+
+LIBRARY ntfs
+EXPORTS
+	FreeNTFSContext
+	Get_MFT_EntryForPath
+	GetFileClusters
