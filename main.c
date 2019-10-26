@@ -305,8 +305,8 @@ BOOL GetFileClustersAL(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *mftrecord, DWO
 }
 // pathlen меньше 0, если функция должна сама найти длину строки в символах
 BOOL _stdcall Get_MFT_EntryForPath(NTFS_VOLUME_CONTEXT **context, WCHAR *path, int pathlen, MFT_REF *result){
-	if (context==0 || path == 0 || result == 0) return 0;
-	
+	if (context == 0 || path == 0 || result == 0) return 0;
+
 	result[0].indexLow = -1; result[0].indexHigh = result[0].ordinal = -1;
 	__try{
 		// Если pathlen не задан, то найти
@@ -315,7 +315,7 @@ BOOL _stdcall Get_MFT_EntryForPath(NTFS_VOLUME_CONTEXT **context, WCHAR *path, i
 	__except (EXCEPTION_EXECUTE_HANDLER){
 		return 0;
 	}
-	DWORD left = 0, current = 0, written = 0, retcode=0;
+	DWORD left = 0, current = 0, written = 0, retcode = 0, index=0;
 	BYTE c = 0;
 
 	for (current = left; current < pathlen; current++) { if (path[current] == ':') break; }
@@ -328,6 +328,7 @@ BOOL _stdcall Get_MFT_EntryForPath(NTFS_VOLUME_CONTEXT **context, WCHAR *path, i
 	if (current == pathlen) return 0;
 	c = path[current];
 	if (c == '/' || c == '\\'); else return 0;
+
 	if (context[0] == 0){
 		context[0] = InitNTFSContext(path[0]);
 		if (context[0] == 0) { return 0; }
@@ -601,7 +602,7 @@ BOOL CALLBACK DllMain(HANDLE hModule, DWORD  Reason, LPVOID lpReserved){
 	return TRUE;
 }
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow){
-	DWORD read = 0, found = 0, inputlen = 0;
+	DWORD read = 0, index=0, found = 0, inputlen = 0;
 	MFT_REF reference = { 0 };
 	WCHAR *buffer = 0;
 	HANDLE consoleIn = 0;
@@ -616,9 +617,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	ReadConsoleW(consoleIn, buffer, 1 << 12, &inputlen, NULL);
 	buffer[inputlen - 2] = 0;
 	WCHAR letter = buffer[0];
-	if (letter >= 'a' && letter <= 'z') { letter -= 'a'; letter += 'A'; }
+	letter |= 32;
 
-	found=Get_MFT_EntryForPath(context+letter-'A', buffer, inputlen-2, &reference);	
+	if (letter < 'a' || letter > 'z') { 
+		WriteConsoleW(consoleOut, L"Invalid path\r\n", sizeof(L"Invalid path\r\n") / 2 - 1, &read, NULL);
+		return 0;
+	}
+	index = letter - 'a';
+	found=Get_MFT_EntryForPath(context+index, buffer, inputlen-2, &reference);	
 	read = 8;
 	if (found == 0){
 		WriteConsoleW(consoleOut, L"File not found", sizeof(L"File not found") / 2 - 1, &read, NULL);
@@ -630,10 +636,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 		read = wsprintfW(buffer, L"%04x%08x", reference.indexHigh, reference.indexLow);
 		WriteConsoleW(consoleOut, buffer, read, &read, NULL);
 		WriteConsoleW(consoleOut, L"\r\n", 2, &read, NULL);
-		found = GetFileClusters(context[letter - 'A'], reference, &read, clusters);
+		found = GetFileClusters(context[index], reference, &read, clusters);
 		if (found == 0){
 			if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) clusters = malloc(read * 3 * 4);
-			found = GetFileClusters(context[letter - 'A'], reference, &read, clusters);
+			found = GetFileClusters(context[index], reference, &read, clusters);
 		}
 		if (found){
 			DWORD written = 0;
