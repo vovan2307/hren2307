@@ -11,19 +11,26 @@ BOOL _stdcall FreeNTFSContext(NTFS_VOLUME_CONTEXT *context);
 BOOL _stdcall Get_MFT_EntryForPath(NTFS_VOLUME_CONTEXT **context, WCHAR *path, int pathlen, MFT_REF *result);
 // Возвращает запись MFT по её номеру
 MFT_RECORD_HEADER * ReadMFTEntry(MFT_REF entry, NTFS_VOLUME_CONTEXT *context);
+// Читает кластер по его номеру
+BYTE * ReadCluster(NTFS_VOLUME_CONTEXT *context, DWORD lcnHigh, DWORD lcnLow);
+BOOL ExpandRunList(BYTE *runlist, DWORD *buflen, DWORD *lcn_len_pairs, BOOL isqword);
 // Возвращает запись MFT для файла или каталога внутри каталога
 FILE_NAME_ATTR *GetMFT_Filename(MFT_RECORD_HEADER *pmft);
 BOOL Get_MFT_EntryForName(NTFS_VOLUME_CONTEXT *context, WCHAR *filename, DWORD namelen, MFT_REF *result);
 // lcn_len_pairs -- массив вида [lcnLow, lcnHigh, length], [lcnLow, lcnHigh, length], ...
 BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWORD *buflen, DWORD *lcn_len_pairs);
-// From attribute list
+// From resident attribute list
 BOOL _stdcall GetFileClustersAL(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *mftrecord, DWORD *buflen, DWORD *lcn_len_pairs);
+// From non resident attribute list
+BOOL _stdcall GetFileClustersALNR(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *mftrecord, DWORD *buflen, DWORD *lcn_len_pairs);
 BOOL StrInStr(BYTE *substr, DWORD sublen, BYTE *str, DWORD len, DWORD *pos, BOOL part);
 BOOL BufferedReadFileSync(HANDLE hFile, BYTE *output, DWORD nbytes, DWORD *read, BYTE *buffer, DWORD buflen);
 
 BOOL FindInIndexRoot(NTFS_VOLUME_CONTEXT *context, INDEX_ROOT *root, WCHAR *filename, DWORD namelen, MFT_REF *result);
 BOOL FindInIndexAllocation(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *alloc, WCHAR *filename, DWORD namelen,
 	BYTE *bitmap, DWORD bitmaplen, MFT_REF *result);
+
+BOOL FindALRecords(NTFS_VOLUME_CONTEXT *context, DWORD *buflen, MFT_REF *output);
 // Поиск в нерезидентной записи
 BOOL FindInIndexRecord(NTFS_VOLUME_CONTEXT *context, DWORD lcnLow, DWORD lcnHigh, WCHAR *filename, DWORD namelen, MFT_REF *result);
 // Если ci!=0, то нужна таблица upcaseTable, которая содержит 2^16 приведений из малого регистра в большой.
@@ -203,15 +210,64 @@ MFT_RECORD_HEADER * ReadMFTEntry(MFT_REF entry, NTFS_VOLUME_CONTEXT *context){
 	diskpos[0] += mftoffset[0];
 	if (diskpos[0] < mftoffset[0]) diskpos[1]++;
 	diskpos[1] += mftoffset[1];
-
-	SetFilePointer(context[0].hvolume, diskpos[0], diskpos + 1, FILE_BEGIN);
-	ReadFile(context[0].hvolume, context[0].mft_stack, 1 << context[0].mft_record_size, diskpos + 1, NULL);
-
+	__try{
+		SetFilePointer(context[0].hvolume, diskpos[0], diskpos + 1, FILE_BEGIN);
+		ReadFile(context[0].hvolume, context[0].mft_stack, 1 << context[0].mft_record_size, diskpos + 1, NULL);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER){
+		return 0;
+	}
 	return context[0].mft_stack;
+}
+BYTE * ReadCluster(NTFS_VOLUME_CONTEXT *context, DWORD lcnHigh, DWORD lcnLow){
+	if (context == 0) return 0;
+	lcnHigh <<= context[0].clustersize;
+	lcnHigh |= lcnLow>> (32-context[0].clustersize);
+	lcnLow <<= context[0].clustersize;
+
+	SetFilePointer(context[0].hvolume, lcnLow, &lcnHigh, FILE_BEGIN);
+	ReadFile(context[0].hvolume, context[0].indexdata_stack, 1 << context[0].clustersize, &lcnLow, 0);
+	SetFilePointer(context[0].hvolume, 0, 0, FILE_BEGIN);
+
+	return context[0].indexdata_stack;
+}
+BOOL ExpandRunList(BYTE *runlist, DWORD *buflen, DWORD *lcn_len_pairs, BOOL isqword){
+	DWORD i = 0, j = 0, count = 0, len = 0, lcn[2] = { 0 }, vcn[2] = { 0 };
+	BYTE mask = 0, *bval=runlist;
+	for (count=0;;count++){
+		mask = runlist[0]; runlist++;
+		if (mask == 0) break;
+		runlist += mask & 15; runlist += mask >> 4;
+	}
+	if (count > buflen[0]){ buflen[0]=count; SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+	runlist = bval;
+	
+	for (count = 0;; count++){
+		mask = runlist[0]; runlist++;
+		if (mask == 0) break;
+		vcn[0] = vcn[1] = len = 0; bval = &len;
+		for (i = 0, j = mask & 15; i < j; i++) bval[i] = runlist[i];
+		bval = vcn;
+		for (i = 0, j = mask>>4; i < j; i++) bval[i] = runlist[i];
+		if (bval[j - 1] & 0x80){ for (i = j; i < 8; i++) bval[i] = 0xff; }
+		lcn[0] += vcn[0];
+		if (lcn[0] < vcn[0]) lcn[1]++;
+		lcn[1] += vcn[1];
+		j = count*2; if (isqword) j += count;
+		lcn_len_pairs[j] = lcn[0]; lcn_len_pairs[j+1] = lcn[1];
+		if (isqword) lcn_len_pairs[j+2] = len;
+	}
+
+	return 1;
 }
 BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWORD *buflen, DWORD *lcn_len_pairs){
 	if (context == 0 || buflen == 0 || lcn_len_pairs == 0) return 0;
-
+#ifdef _DEBUG
+	WCHAR wbuffer[16] = { 0 }; DWORD written = 0;
+	WriteConsoleW(consoleOut, L"file reference: ", sizeof(L"file reference: ") / 2 - 1, &written, 0);
+	WriteConsoleW(consoleOut, wbuffer, wsprintfW(wbuffer, L"%x", fileref.indexLow), &written, 0);
+	WriteConsoleW(consoleOut, L"\r\n", 2, &written, 0);
+#endif
 	if (ReadMFTEntry(fileref, context) == 0){ SetLastError(ERROR_FILE_NOT_FOUND); return 0; }
 	BYTE *mft_record_buffer = context[0].mft_stack;
 	MFT_RECORD_HEADER *header = mft_record_buffer;
@@ -235,7 +291,9 @@ BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWO
 		if (dataattr[0].non_resident == 0) { buflen[0] = 0; return 0; }
 		runlist = (BYTE*)dataattr + mftattr[0].nr.mapping_pairs_offset;
 	}
-	else{ return GetFileClustersAL(context, listattr, buflen, lcn_len_pairs); }
+	else{
+		return GetFileClustersAL(context, listattr, buflen, lcn_len_pairs);
+	}
 	for (DWORD j=0;;){
 		j = runlist[0]; runlist++;
 		if (j == 0) break;
@@ -264,7 +322,81 @@ BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWO
 	}
 	return 1;
 }
+BOOL _stdcall GetFileClustersALNR(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *mftrecord, DWORD *buflen, DWORD *lcn_len_pairs){
+	BYTE *cursor = mftrecord, *runlist=0;
+	ATTRIBUTE_LIST_HEADER *listattr = 0;
+	runlist = cursor + mftrecord[0].nr.mapping_pairs_offset;
+	DWORD len = 0, lcn = 0, vcn = 0, count=0, counted=0;
+	BYTE mask=0, *bdata = 0;
+
+	for (DWORD i=0, j=0;;){
+		mask = runlist[0]; runlist++;
+		if (mask == 0) break;
+		vcn=len=0; bdata = &len;
+		for (i = 0, j = mask & 15; i < j; i++) bdata[i] = runlist[i];
+		if (len > 1) return 0;
+		runlist += mask & 15; bdata = &vcn;
+		for (i = 0, j = mask>>4; i < j; i++) bdata[i] = runlist[i];
+		if (bdata[(mask >> 4)-1] & 0x80){ for (i = mask >> 4; i < 4; i++) bdata[i] = 0xff; }
+		runlist += mask >> 4; lcn += vcn;
+		for (i = 0; i < len; i++){
+			listattr = cursor = ReadCluster(context, 0, lcn + i);
+			if (cursor == 0) return 0;
+			for (;;){
+				listattr = cursor;
+				cursor += listattr[0].size;
+				if (listattr[0].size == 0) break;
+				if (listattr[0].type != AT_DATA || listattr[0].name_size > 0) continue;
+				if (listattr[0].file_reference.indexLow < 0x40) continue;
+
+				context[0].mft_stack += 1 << context[0].mft_record_size;
+				count = 0;
+				GetFileClusters(context, listattr[0].file_reference, &count, lcn_len_pairs);
+				context[0].mft_stack -= 1 << context[0].mft_record_size;
+				counted += count;
+			}
+		}
+	}
+
+	if (counted > buflen[0]){ buflen[0]=counted;SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+	
+	cursor = mftrecord;
+	runlist = cursor + mftrecord[0].nr.mapping_pairs_offset;
+	buflen[0]=counted; counted = 0; count = buflen[0];
+
+	for (DWORD i = 0, j = 0;;){
+		mask = runlist[0]; runlist++;
+		if (mask == 0) break;
+		vcn = len = 0; bdata = &len;
+		for (i = 0, j = mask & 15; i < j; i++) bdata[i] = runlist[i];
+		runlist += mask & 15; bdata = &vcn;
+		for (i = 0, j = mask >> 4; i < j; i++) bdata[i] = runlist[i];
+		if (bdata[(mask >> 4) - 1] & 0x80){ for (i = mask >> 4; i < 4; i++) bdata[i] = 0xff; }
+		runlist += mask >> 4; lcn += vcn;
+		for (i = 0; i < len; i++){
+			listattr = cursor = ReadCluster(context, 0, lcn + i);
+			if (cursor == 0) return 0;
+			for (;;){
+				listattr = cursor;
+				cursor += listattr[0].size;
+				if (listattr[0].size == 0) break;
+				if (listattr[0].type != AT_DATA || listattr[0].name_size > 0) continue;
+				if (listattr[0].file_reference.indexLow < 0x40) continue;
+
+				count = buflen[0] - counted;
+				context[0].mft_stack += 1 << context[0].mft_record_size;
+				GetFileClusters(context, listattr[0].file_reference, &count, lcn_len_pairs+counted*3);
+				context[0].mft_stack -= 1 << context[0].mft_record_size;
+				counted += count;
+			}
+		}
+	}
+
+	return 1;
+}
 BOOL GetFileClustersAL(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *mftrecord, DWORD *buflen, DWORD *lcn_len_pairs){
+	if (mftrecord[0].non_resident) return GetFileClustersALNR(context, mftrecord, buflen, lcn_len_pairs);
+
 	ATTRIBUTE_LIST_HEADER *listattr = 0;
 	BYTE *cursor = mftrecord;
 	DWORD count = 0, counted=0;
@@ -274,16 +406,19 @@ BOOL GetFileClustersAL(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *mftrecord, DWO
 		listattr = cursor;
 		if (listattr[0].type == AT_END) break;
 		cursor += listattr[0].size;
-		if (listattr[0].type == AT_ATTRIBUTE_LIST || listattr[0].type == AT_DATA){
+		for (; listattr[0].type == AT_ATTRIBUTE_LIST || listattr[0].type == AT_DATA;){
 			count = 0;
+			if (listattr[0].type == AT_DATA && listattr[0].name_size>0) break;
+			if (listattr[0].file_reference.indexLow < 0x40) break;
+
 			context[0].mft_stack += 1 << context[0].mft_record_size;
 			GetFileClusters(context, listattr[0].file_reference, &count, lcn_len_pairs);
 			context[0].mft_stack -= 1 << context[0].mft_record_size;
 			counted += count;
+			break;
 		}
 	}
-	if (counted > buflen[0]){ SetLastError(ERROR_INSUFFICIENT_BUFFER); buflen[0] = counted; 
-		return 0; }
+	if (counted > buflen[0]){ SetLastError(ERROR_INSUFFICIENT_BUFFER); buflen[0] = counted; return 0; }
 	
 	buflen[0] = counted; counted = 0; count = buflen[0];
 	cursor = mftrecord; cursor += mftrecord[0].r.value_offset;
@@ -292,12 +427,16 @@ BOOL GetFileClustersAL(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *mftrecord, DWO
 		listattr = cursor;
 		if (listattr[0].type == AT_END) break;
 		cursor += listattr[0].size;
-		if (listattr[0].type == AT_ATTRIBUTE_LIST || listattr[0].type == AT_DATA){
+		for (; listattr[0].type == AT_ATTRIBUTE_LIST || listattr[0].type == AT_DATA;){
 			count = buflen[0] - counted;
+			if (listattr[0].type == AT_DATA && listattr[0].name_size>0) break;
+			if (listattr[0].file_reference.indexLow < 0x40) break;
+
 			context[0].mft_stack += 1 << context[0].mft_record_size;
 			GetFileClusters(context, listattr[0].file_reference, &count, lcn_len_pairs + counted * 3);
 			context[0].mft_stack -= 1 << context[0].mft_record_size;
 			counted += count;
+			break;
 		}
 	}
 	SetLastError(0); buflen[0] = counted;
@@ -386,23 +525,6 @@ BOOL StrInStr(BYTE *substr, DWORD sublen, BYTE *str, DWORD len, DWORD *pos, BOOL
 	}
 	pos[0] = len + 1; return 1;
 }
-
-BOOL BufferedReadFileSync(HANDLE hFile, BYTE *output, DWORD nbytes, DWORD *read, BYTE *buffer, DWORD buflen){
-	DWORD i = 0, read1=0, tocopy=buflen;
-	BOOL result = 0;
-	for (; i < nbytes;){
-		read1 = 0;
-		result = ReadFile(hFile, buffer, buflen, &read1, NULL);
-		if (result == 0) break;
-		if (nbytes - i < buflen) tocopy = nbytes - i;
-		memcpy_s(output + i, nbytes - i, buffer, tocopy);
-		i += tocopy;
-		if (i >= nbytes) break;
-	}
-	read[0] = i;
-	return 0;
-}
-
 FILE_NAME_ATTR *GetMFT_Filename(MFT_RECORD_HEADER *pmft){
 	if (pmft == 0) return 0;
 	BYTE *mft_record_cursor = pmft;
@@ -421,6 +543,37 @@ FILE_NAME_ATTR *GetMFT_Filename(MFT_RECORD_HEADER *pmft){
 	return mft_record_cursor;
 }
 
+BOOL FindALRecords(NTFS_VOLUME_CONTEXT *context, DWORD *buflen, DWORD *output){
+	if (context == 0 || buflen == 0 || output == 0) return 0;
+	DWORD index = 0, count = 0;
+	BYTE *mft_record_cursor = 0;
+	ATTR_RECORD *mftattr = 0, *attrlist=0;
+	MFT_RECORD_HEADER *mftheader = 0;
+
+	MFT_REF reference = { 0 };
+	reference.ordinal = reference.indexHigh = 0;
+	reference.indexLow = -1;
+
+	for (index = 0;; index++){
+		reference.indexLow = index;
+		mftheader = ReadMFTEntry(reference, context);
+		if (mftheader== 0) break;
+		mft_record_cursor = mftheader;
+		mft_record_cursor += mftheader[0].attributes_offset;
+		for (attrlist=0;;){
+			mftattr = mft_record_cursor;
+			if (mftattr[0].type == AT_END) break;
+			if (mftattr[0].type == AT_ATTRIBUTE_LIST){ attrlist = mftattr; break; }
+			mft_record_cursor += mftattr[0].length;
+		}
+		if (attrlist == 0) continue;
+		if (count < buflen[0]) output[count] = index;
+		count++;
+	}
+	if (count > buflen[0]){ buflen[0] = count; SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+	buflen[0] = count;
+	SetLastError(0); return 1;
+}
 BOOL FindInIndexRecord(NTFS_VOLUME_CONTEXT *context, DWORD lcnLow, DWORD lcnHigh, WCHAR *filename, DWORD namelen, MFT_REF *result){
 	result[0].ordinal = result[0].indexHigh = -1; result[0].indexLow = -1;
 	context[0].indexdata_vcn = -1;
@@ -609,6 +762,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	NTFS_VOLUME_CONTEXT *context[26] = { 0 };
 	DWORD clusters1[24] = { 0 };
 	DWORD *clusters = clusters1;
+	DWORD atrecords[20] = { 0 };
 
 	AllocConsole(); consoleOut = GetStdHandle(STD_OUTPUT_HANDLE); consoleIn = GetStdHandle(STD_INPUT_HANDLE);
 	buffer = VirtualAlloc(0, 1 << 15, MEM_COMMIT, PAGE_READWRITE);
@@ -625,7 +779,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	}
 	index = letter - 'a';
 	found=Get_MFT_EntryForPath(context+index, buffer, inputlen-2, &reference);	
-	read = 8;
+	inputlen = 20;
+	FindALRecords(context[index], &inputlen, atrecords);
+
 	if (found == 0){
 		WriteConsoleW(consoleOut, L"File not found", sizeof(L"File not found") / 2 - 1, &read, NULL);
 		WriteConsoleW(consoleOut, L"\r\n", 2, &read, NULL);
@@ -656,7 +812,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 			}
 		}
 	}
-
+	reference.ordinal = reference.indexHigh = 0;
+	reference.indexLow = atrecords[1];
+	for (DWORD i = 1; i < inputlen; i++){
+		reference.indexLow = atrecords[i];
+		read = 8;
+		found = GetFileClusters(context[index], reference, &read, clusters);
+		found = 0;
+	}
 	WriteConsoleW(consoleOut, L"Press enter to exit", sizeof(L"Press enter to exit") / 2 - 1, &read, NULL);
 	ReadConsoleW(consoleIn, buffer, 4, &read, NULL);
 	
