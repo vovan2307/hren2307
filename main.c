@@ -261,14 +261,15 @@ BOOL ExpandRunList(BYTE *runlist, DWORD *buflen, DWORD *lcn_len_pairs, BOOL isqw
 	return 1;
 }
 BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWORD *buflen, DWORD *lcn_len_pairs){
-	if (context == 0 || buflen == 0 || lcn_len_pairs == 0) return 0;
+	if (context == 0 || buflen == 0 || lcn_len_pairs == 0) { SetLastError(ERROR_INVALID_PARAMETER); buflen[0] = 0; return 0; }
+	if (fileref.indexHigh == -1 && fileref.indexLow == -1) { SetLastError(ERROR_FILE_NOT_FOUND); buflen[0] = 0; return 0; }
 #ifdef _DEBUG
 	WCHAR wbuffer[16] = { 0 }; DWORD written = 0;
 	WriteConsoleW(consoleOut, L"file reference: ", sizeof(L"file reference: ") / 2 - 1, &written, 0);
 	WriteConsoleW(consoleOut, wbuffer, wsprintfW(wbuffer, L"%x", fileref.indexLow), &written, 0);
 	WriteConsoleW(consoleOut, L"\r\n", 2, &written, 0);
 #endif
-	if (ReadMFTEntry(fileref, context) == 0){ SetLastError(ERROR_FILE_NOT_FOUND); return 0; }
+	if (ReadMFTEntry(fileref, context) == 0){ SetLastError(ERROR_FILE_NOT_FOUND); buflen[0] = 0; return 0; }
 	BYTE *mft_record_buffer = context[0].mft_stack;
 	MFT_RECORD_HEADER *header = mft_record_buffer;
 	ATTRIBUTE_LIST_HEADER *attrlist = 0;
@@ -531,16 +532,21 @@ FILE_NAME_ATTR *GetMFT_Filename(MFT_RECORD_HEADER *pmft){
 	mft_record_cursor += pmft[0].attributes_offset;
 	ATTR_RECORD *mft_attr = mft_record_cursor;
 	ATTR_RECORD *nameattr = 0;
+	FILE_NAME_ATTR *result = 0;
 	for (;;){
 		mft_attr = mft_record_cursor;
 		if (mft_attr[0].type == AT_END) break;
-		if (mft_attr[0].type == AT_FILE_NAME) nameattr = mft_attr;
+		if (mft_attr[0].type == AT_FILE_NAME){
+			nameattr = mft_attr; result = mft_record_cursor + mft_attr[0].r.value_offset;
+			if (result[0].name_space != 2) break;
+		}
 		mft_record_cursor += mft_attr[0].length;
 	}
-	if (nameattr == 0) return 0;
-	mft_record_cursor = nameattr;
-	mft_record_cursor += nameattr[0].r.value_offset;
-	return mft_record_cursor;
+	if (result == 0) return 0;
+#ifdef _DEBUG
+	printf("found namespace=%x\r\n", result[0].name_space);
+#endif
+	return result;
 }
 
 BOOL FindALRecords(NTFS_VOLUME_CONTEXT *context, DWORD *buflen, DWORD *output){
@@ -575,6 +581,9 @@ BOOL FindALRecords(NTFS_VOLUME_CONTEXT *context, DWORD *buflen, DWORD *output){
 	SetLastError(0); return 1;
 }
 BOOL FindInIndexRecord(NTFS_VOLUME_CONTEXT *context, DWORD lcnLow, DWORD lcnHigh, WCHAR *filename, DWORD namelen, MFT_REF *result){
+#ifdef _DEBUG
+	printf("Entry at cluster %x%08x\r\n", lcnHigh, lcnLow);
+#endif
 	result[0].ordinal = result[0].indexHigh = -1; result[0].indexLow = -1;
 	context[0].indexdata_vcn = -1;
 
@@ -599,13 +608,14 @@ BOOL FindInIndexRecord(NTFS_VOLUME_CONTEXT *context, DWORD lcnLow, DWORD lcnHigh
 		dirheader = buffer_cursor; pvcn = 0;
 		if (dirheader[0].flags&INDEX_ENTRY_NODE){
 #ifdef _DEBUG
-			WriteConsoleW(consoleOut, L"has subnode\r\n", sizeof(L"has subnode\r\n")/2-1, &k, NULL);
+			printf("has subnode\r\n");
 #endif
 			pvcn = buffer_cursor + dirheader[0].length - 8;
 		}
 		if (dirheader[0].flags&INDEX_ENTRY_END) break;
 		buffer_cursor += dirheader[0].length;
 		FILE_NAME_ATTR *fname = &dirheader[0].file_name;
+
 		if (fname[0].name_space!=2){
 			context[0].mft_stack += 1 << context[0].mft_record_size;
 			ReadMFTEntry(dirheader[0].indexed_file, context);
@@ -636,7 +646,12 @@ BOOL FindInIndexRoot(NTFS_VOLUME_CONTEXT *context, INDEX_ROOT *root, WCHAR *file
 	for (count=0;;count++){
 		dirheader = buffer_cursor; cmp = -1; pvcn = 0;
 
-		if (dirheader[0].flags&INDEX_ENTRY_NODE){ pvcn = buffer_cursor + dirheader[0].length - 8; }
+		if (dirheader[0].flags&INDEX_ENTRY_NODE){
+			pvcn = buffer_cursor + dirheader[0].length - 8;
+#ifdef _DEBUG
+			printf("Has subnode with vcn=%08x\r\n", pvcn[0]);
+#endif
+		}
 		if (dirheader[0].flags & INDEX_ENTRY_END) break;
 		FILE_NAME_ATTR *fname = &dirheader[0].file_name;
 
@@ -754,7 +769,7 @@ BOOL CALLBACK DllMain(HANDLE hModule, DWORD  Reason, LPVOID lpReserved){
 	}
 	return TRUE;
 }
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow){
+int _cdecl main(int argc, char **argv){
 	DWORD read = 0, index=0, found = 0, inputlen = 0;
 	MFT_REF reference = { 0 };
 	WCHAR *buffer = 0;
@@ -764,34 +779,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	DWORD *clusters = clusters1;
 	DWORD atrecords[20] = { 0 };
 
-	AllocConsole(); consoleOut = GetStdHandle(STD_OUTPUT_HANDLE); consoleIn = GetStdHandle(STD_INPUT_HANDLE);
+	consoleOut = GetStdHandle(STD_OUTPUT_HANDLE); consoleIn = GetStdHandle(STD_INPUT_HANDLE);
 	buffer = VirtualAlloc(0, 1 << 15, MEM_COMMIT, PAGE_READWRITE);
 
-	WriteConsoleW(consoleOut, L"Enter path to find in NTFS\r\n", sizeof(L"Enter path to find in NTFS\r\n") / 2 - 1, &read, NULL);
+	wprintf(L"%s", L"Enter path to find in NTFS\r\n");
 	ReadConsoleW(consoleIn, buffer, 1 << 12, &inputlen, NULL);
 	buffer[inputlen - 2] = 0;
 	WCHAR letter = buffer[0];
 	letter |= 32;
 
 	if (letter < 'a' || letter > 'z') { 
-		WriteConsoleW(consoleOut, L"Invalid path\r\n", sizeof(L"Invalid path\r\n") / 2 - 1, &read, NULL);
+		wprintf(L"%s", L"Invalid path\r\n");
 		return 0;
 	}
 	index = letter - 'a';
 	found=Get_MFT_EntryForPath(context+index, buffer, inputlen-2, &reference);	
 	inputlen = 20;
-	FindALRecords(context[index], &inputlen, atrecords);
 
-	if (found == 0){
-		WriteConsoleW(consoleOut, L"File not found", sizeof(L"File not found") / 2 - 1, &read, NULL);
-		WriteConsoleW(consoleOut, L"\r\n", 2, &read, NULL);
-	}
+	if (found == 0){wprintf(L"%s", L"File not found\r\n");}
 	else{
 		read = 8;
-		WriteConsoleW(consoleOut, L"File found at ", sizeof(L"File found at ") / 2 - 1, &read, NULL);
-		read = wsprintfW(buffer, L"%04x%08x", reference.indexHigh, reference.indexLow);
-		WriteConsoleW(consoleOut, buffer, read, &read, NULL);
-		WriteConsoleW(consoleOut, L"\r\n", 2, &read, NULL);
+		CHAR *fmt = "%x%08x\r\n";
+		if (reference.indexHigh == 0) fmt = "%x%x\r\n";
+		printf("File found at:");
+		printf(fmt, reference.indexHigh, reference.indexLow);
 		found = GetFileClusters(context[index], reference, &read, clusters);
 		if (found == 0){
 			if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) clusters = malloc(read * 3 * 4);
@@ -799,31 +810,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 		}
 		if (found){
 			DWORD written = 0;
-			WriteConsoleW(consoleOut, L"File fragments:\r\n", sizeof(L"File fragments:\r\n") / 2 - 1, &written, 0);
+			printf("File fragments:\r\n");
 			for (DWORD i = 0, j = 0; i < read; i++, j += 3){
-				WCHAR *fmt = L"%x%08x";
-				if (clusters[j + 1] == 0) fmt = L"%x%x";
-				WriteConsoleW(consoleOut, L"Start cluster : ", sizeof(L"Start cluster: ")/2-1, &written, 0);
-				buffer[written = wsprintfW(buffer, fmt, clusters[j + 1], clusters[j])] = 0;
-				WriteConsoleW(consoleOut, buffer, written, &written, 0);
-				WriteConsoleW(consoleOut, L", length: ", sizeof(L", length: ")/2-1, &written, 0);
-				buffer[written = wsprintfW(buffer, L"%08x\r\n", clusters[j + 2])] = 0;
-				WriteConsoleW(consoleOut, buffer, written, &written, 0);
+				fmt = "%x%08x";
+				if (clusters[j + 1] == 0) fmt = "%x%x";
+				printf("Start cluster : ");
+				printf(fmt, clusters[j + 1], clusters[j]);
+				printf(", length: %x\r\n", clusters[j + 2]);
 			}
 		}
 	}
-	reference.ordinal = reference.indexHigh = 0;
-	reference.indexLow = atrecords[1];
-	for (DWORD i = 1; i < inputlen; i++){
-		reference.indexLow = atrecords[i];
-		read = 8;
-		found = GetFileClusters(context[index], reference, &read, clusters);
-		found = 0;
-	}
-	WriteConsoleW(consoleOut, L"Press enter to exit", sizeof(L"Press enter to exit") / 2 - 1, &read, NULL);
+	printf("Press enter to exit");
 	ReadConsoleW(consoleIn, buffer, 4, &read, NULL);
-	
 	VirtualFree(buffer, 0, MEM_RELEASE);
-	FreeConsole();
+	
 	return 0;
 }
