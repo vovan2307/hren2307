@@ -297,12 +297,12 @@ BOOL ExpandRunList(BYTE *runlist, DWORD *buflen, DWORD *lcn_len_pairs, BOOL isqw
 }
 BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWORD *buflen, DWORD *lcn_len_pairs){
 	if (context == 0 || buflen == 0 || lcn_len_pairs == 0) return 0;
-#ifdef _DEBUG
-	WCHAR wbuffer[16] = { 0 }; DWORD written = 0;
-	FILE *logfile = getfp(GetCurrentThreadId());
-	fwprintf(logfile, L"file reference: %x\r\n", fileref.indexLow);
-#endif
-	if (ReadMFTEntry(fileref, context) == 0){ SetLastError(ERROR_FILE_NOT_FOUND); return 0; } // если нельзя прочитать файловую запись
+	
+	if (fileref.indexHigh>0x8000){
+		buflen[0]=0;SetLastError(ERROR_FILE_NOT_FOUND); return 0;}// если передали неправильный номер файловой записи
+	if (ReadMFTEntry(fileref, context) == 0){ 
+		buflen[0]=0;SetLastError(ERROR_FILE_NOT_FOUND); return 0; } // если нельзя прочитать файловую запись
+	
 	BYTE *mft_record_buffer = context[0].mft_stack; // на начало считанной записи по номеру
 	MFT_RECORD_HEADER *header = mft_record_buffer;
 	ATTRIBUTE_LIST_HEADER *attrlist = 0;
@@ -621,8 +621,6 @@ BOOL FindInIndexRecord(NTFS_VOLUME_CONTEXT *context, DWORD lcnLow, DWORD lcnHigh
 	result[0].ordinal = result[0].indexHigh = -1; result[0].indexLow = -1;
 	context[0].indexdata_vcn = -1;
 
-	fwprintf(logfile, L"Search in index record at LCN=%x\r\n", lcnLow);
-
 	lcnHigh <<= context[0].clustersize;
 	lcnHigh |= lcnLow >> (32 - context[0].clustersize);
 	lcnLow <<= context[0].clustersize;
@@ -635,18 +633,12 @@ BOOL FindInIndexRecord(NTFS_VOLUME_CONTEXT *context, DWORD lcnLow, DWORD lcnHigh
 	SetFilePointer(context[0].hvolume, lcnLow, &lcnHigh, FILE_BEGIN);
 	ReadFile(context[0].hvolume, buffer_cursor, context[0].index_block_size, &read, NULL);
 
-	if (alloc[0].magic != 'XDNI'){
-		fwprintf(logfile, L"Invalid index record at LCN=%x\r\n", lcnLow);
-		return 0;
-	}
+	if (alloc[0].magic != 'XDNI'){ return 0; }
 	buffer_cursor = &alloc[0].index; // на заголовок первого узла
 	buffer_cursor += alloc[0].index.entries_offset; // смещение тела первого индексного элемента относительно заголовка узла
 	for (DWORD i = 0, k = 0;;){
 		dirheader = buffer_cursor; pvcn = 0;
 		if (dirheader[0].flags&INDEX_ENTRY_NODE){ // если есть подкаталог (IA)
-#ifdef _DEBUG
-			fwprintf(logfile, L"has subnode\r\n");
-#endif
 			pvcn = buffer_cursor + dirheader[0].length - 8; // запоминаем этот подузел
 		}
 		if (dirheader[0].flags&INDEX_ENTRY_END) break; // если последний элемент
@@ -658,10 +650,6 @@ BOOL FindInIndexRecord(NTFS_VOLUME_CONTEXT *context, DWORD lcnLow, DWORD lcnHigh
 			fname = GetMFT_Filename(context[0].mft_stack); // смещение тела атрибута FILE_NAME относительно начала записи для индексного элемента
 			context[0].mft_stack -= 1 << context[0].mft_record_size;
 		}
-#ifdef _DEBUG
-		fwrite(fname[0].namebody, 2, fname[0].name_size, logfile); // вывод имени найденного файла
-		fwrite(L"\r\n", 2, 2, logfile);
-#endif
 		int cmp = CmpStringW(filename, namelen, fname[0].namebody, fname[0].name_size, context[0].Upcase, 1); // сравнение имени искомого имени файлового объекта с именем текущего элемента
 		if (cmp > 0) continue;
 		if (cmp < 0) break;
@@ -669,7 +657,6 @@ BOOL FindInIndexRecord(NTFS_VOLUME_CONTEXT *context, DWORD lcnLow, DWORD lcnHigh
 		result[0] = dirheader[0].indexed_file; return 1;
 	}
 	if (pvcn){ context[0].indexdata_vcn = pvcn[0]; } // если подкаталог, то ищем в нем
-	fwprintf(logfile, L"found vcn=%x\r\n", pvcn[0]);
 	return 0;
 }
 BOOL FindInIndexRoot(NTFS_VOLUME_CONTEXT *context, INDEX_ROOT *root, WCHAR *filename, DWORD namelen, MFT_REF *result){ // поиск в IR записи (начиная со смещения тела IR) файлового объекта по его имени, возвращает номер записи в виде структуры
@@ -679,7 +666,6 @@ BOOL FindInIndexRoot(NTFS_VOLUME_CONTEXT *context, INDEX_ROOT *root, WCHAR *file
 	DWORD *pvcn = 0;
 	DWORD count = 0, written = 0;
 	int cmp = 0;
-	FILE *logfile = getfp(GetCurrentThreadId());
 	for (count = 0;; count++){
 		dirheader = buffer_cursor; cmp = -1; pvcn = 0;
 
@@ -694,18 +680,12 @@ BOOL FindInIndexRoot(NTFS_VOLUME_CONTEXT *context, INDEX_ROOT *root, WCHAR *file
 			context[0].mft_stack -= 1 << context[0].mft_record_size;
 		}
 		cmp = CmpStringW(filename, namelen, fname[0].namebody, fname[0].name_size, context[0].Upcase, 1); // сравнение искомого имени файла с текущим
-#ifdef _DEBUG
-		fwrite(fname[0].namebody, 2, fname[0].name_size, logfile);
-		fwrite(L"\r\n", 2, 2, logfile);
-#endif
 		if (cmp < 1) break; // если имя искомого файла меньше имени узла, то искать в нерезидентной группе
 		buffer_cursor += dirheader[0].length; // к следующему индексному элементу
 	}
 	if (cmp == 0){ result[0] = dirheader[0].indexed_file; return 1; } // если нашли номер записи в IR, то возвращаем его в виде структуры
 	if (pvcn){ context[0].indexdata_vcn = pvcn[0]; } // если не в IR, то получаем VCN узла IA нужной нерезидентной группы
-#ifdef _DEBUG
-	fwprintf(logfile, L"found vcn=%x\r\n", pvcn[0]);
-#endif
+
 	return 0;
 }
 BOOL FindInIndexAllocation(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *alloc, WCHAR *filename, DWORD namelen,
@@ -804,18 +784,8 @@ BOOL CALLBACK DllMain(HANDLE hModule, DWORD  Reason, LPVOID lpReserved){
 	case DLL_PROCESS_DETACH:
 		break;
 	case DLL_THREAD_ATTACH:
-		namebuf[sprintf_s(namebuf, 24, "log-%d.log", GetCurrentThreadId())] = 0;
-		fopen_s(logfiles+threads, namebuf, "wb");
-		threads++;
 		break;
 	case DLL_THREAD_DETACH:
-		for (i = 0; i < threads; i++) if (tids[i] == tid) break;
-		if (i == threads)break;
-		fclose(logfiles[i]);
-		for (; i < threads - 1; i++) { tids[i] = tids[i + 1]; logfiles[i] = logfiles[i + 1]; }
-
-		threads--;
-		tids[threads] = 0; logfiles[threads] = 0;		
 		break;
 	}
 	return TRUE;
@@ -843,7 +813,7 @@ int _cdecl main(int argc, char **argv){
 	index = letter - 'a';
 	found = Get_MFT_EntryForPath(context + index, buffer, inputlen - 2, &reference);	// номер записи
 	inputlen = 20;
-	FindALRecords(context[index], &inputlen, atrecords);
+	//FindALRecords(context[index], &inputlen, atrecords);
 
 	if (found == 0){ wprintf(L"File not found\r\n"); }
 	else{ // если есть номер записи
