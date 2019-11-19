@@ -668,9 +668,7 @@ BOOL FindInIndexRoot(NTFS_VOLUME_CONTEXT *context, INDEX_ROOT *root, WCHAR *file
 	int cmp = 0;
 	for (count = 0;; count++){
 		dirheader = buffer_cursor; cmp = -1; pvcn = 0;
-
-		if (dirheader[0].flags&INDEX_ENTRY_NODE){ pvcn = buffer_cursor + dirheader[0].length - 8; } // если не последний элемент в узле, то получаем смещение следующего
-		if (dirheader[0].flags & INDEX_ENTRY_END) break;
+		if (dirheader[0].flags&INDEX_ENTRY_NODE){ pvcn = buffer_cursor + dirheader[0].length - 8; } // если не последний элемент в узле, то получаем смещение следующего		
 		FILE_NAME_ATTR *fname = &dirheader[0].file_name; // получаем атрибут FILE_NAME текущего индексного элемента
 
 		if (fname[0].name_space != 2){
@@ -681,6 +679,7 @@ BOOL FindInIndexRoot(NTFS_VOLUME_CONTEXT *context, INDEX_ROOT *root, WCHAR *file
 		}
 		cmp = CmpStringW(filename, namelen, fname[0].namebody, fname[0].name_size, context[0].Upcase, 1); // сравнение искомого имени файла с текущим
 		if (cmp < 1) break; // если имя искомого файла меньше имени узла, то искать в нерезидентной группе
+		if (dirheader[0].flags & INDEX_ENTRY_END) break;
 		buffer_cursor += dirheader[0].length; // к следующему индексному элементу
 	}
 	if (cmp == 0){ result[0] = dirheader[0].indexed_file; return 1; } // если нашли номер записи в IR, то возвращаем его в виде структуры
@@ -715,10 +714,15 @@ BOOL FindInIndexAllocation(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *alloc, WCH
 		context[0].dir_fragments = i + 1;
 	}
 	i = 0;
-	for (;;){
-		vcn[0] = context[0].indexdata_vcn; // полученный VCN узла нужного отрезка после поиска в IR, или после функции FindInIndexRecord
-		if (vcn[0] == -1 || vcn[0]>alloc[0].nr.highest_vcn.LowPart) break;
+	for (DWORD j = 0; j < bitmaplen * 8;){
+		BYTE mask = bitmap[j >> 3];
+		if (mask == 0) { j+=8; continue; }// Пропустить 8 кластеров, если байт карты равен 0
+		mask &= 1 << (j & 7);
+		if (mask == 0){ j++; continue; } // Пропустить 1 кластер, если бит карты равен 0
 
+		vcn[0] = j; // VCN узла из битовой карты vcn
+		if (j>alloc[0].nr.highest_vcn.LowPart) break;
+		// Цикл нахождения нужного фрагмента IA по номеру vcn
 		for (i = 0; i < context[0].dir_fragments; i++){
 			if (vcn[0] < context[0].dir_fragment_lens[i]) break;
 			vcn[0] -= context[0].dir_fragment_lens[i];
@@ -730,6 +734,7 @@ BOOL FindInIndexAllocation(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *alloc, WCH
 		vcn[0] += lcn[0];
 		found = FindInIndexRecord(context, vcn[0], 0, filename, namelen, result); // в найденном кластере ищется запись файлового объекта по имени и возвращается номер записи в виде структуры
 		if (found) return 1;
+		j++; // Идём дальше по битовой карте
 	}
 	SetLastError(ERROR_FILE_NOT_FOUND); return 0;
 }
@@ -813,7 +818,6 @@ int _cdecl main(int argc, char **argv){
 	index = letter - 'a';
 	found = Get_MFT_EntryForPath(context + index, buffer, inputlen - 2, &reference);	// номер записи
 	inputlen = 20;
-	//FindALRecords(context[index], &inputlen, atrecords);
 
 	if (found == 0){ wprintf(L"File not found\r\n"); }
 	else{ // если есть номер записи
