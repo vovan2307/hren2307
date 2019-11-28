@@ -321,7 +321,7 @@ BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWO
 	}
 
 	if (listattr == 0){ // если нет AL
-		if (dataattr == 0) return 0;
+		if (dataattr == 0) { buflen[0] = 0; return 0; }
 		if (dataattr[0].non_resident == 0) { buflen[0] = 0; return 0; } // если резидентный
 		runlist = (BYTE*)dataattr + mftattr[0].nr.mapping_pairs_offset; // смещение списка отрезков получаем
 	}
@@ -332,6 +332,7 @@ BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWO
 	for (DWORD j = 0;;){
 		j = runlist[0]; runlist++;
 		if (j == 0) break;
+		
 		runlist += (j & 15) + (j >> 4);
 		counted++; // количество отрезков
 	}
@@ -342,6 +343,7 @@ BOOL _stdcall GetFileClusters(NTFS_VOLUME_CONTEXT *context, MFT_REF fileref, DWO
 	for (DWORD i = 0, i1 = 0, j = 0, k = 0;;){
 		j = runlist[0]; runlist++;
 		if (j == 0) break;
+		if ((j & 15) > 4 || (j >> 4) > 4) break;
 		lcn_len_pairs[i1 + 1] = lcn_len_pairs[i1 + 2] = 0;
 		// Выписать длину фрагмента
 		bvcn = lcn_len_pairs + i1 + 2;
@@ -403,7 +405,7 @@ BOOL _stdcall GetFileClustersALNR(NTFS_VOLUME_CONTEXT *context, ATTR_RECORD *mft
 	for (DWORD i = 0, j = 0;;){
 		mask = runlist[0]; runlist++;
 		if (mask == 0) break;
-		vcn = len = 0; bdata = &len;
+		lcn = vcn = len = 0; bdata = &len;
 		for (i = 0, j = mask & 15; i < j; i++) bdata[i] = runlist[i];
 		runlist += mask & 15; bdata = &vcn;
 		for (i = 0, j = mask >> 4; i < j; i++) bdata[i] = runlist[i];
@@ -805,7 +807,7 @@ int _cdecl main(int argc, char **argv){
 	DWORD *clusters = clusters1;
 	DWORD atrecords[20] = { 0 };
 
-	AllocConsole(); consoleOut = GetStdHandle(STD_OUTPUT_HANDLE); consoleIn = GetStdHandle(STD_INPUT_HANDLE);
+	consoleOut = GetStdHandle(STD_OUTPUT_HANDLE); consoleIn = GetStdHandle(STD_INPUT_HANDLE);
 	buffer = VirtualAlloc(0, 1 << 15, MEM_COMMIT, PAGE_READWRITE);
 
 	WriteConsoleW(consoleOut, L"Enter path to find in NTFS\r\n", sizeof(L"Enter path to find in NTFS\r\n") / 2 - 1, &read, NULL);
@@ -823,6 +825,7 @@ int _cdecl main(int argc, char **argv){
 	else{ // если есть номер записи
 		read = 8;
 		wprintf(L"File found at %04x%08x\r\n", reference.indexHigh, reference.indexLow);
+		
 		found = GetFileClusters(context[index], reference, &read, clusters); // поиск кластеров
 		if (found == 0){
 			if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) clusters = malloc(read * 3 * 4);
@@ -840,18 +843,9 @@ int _cdecl main(int argc, char **argv){
 			}
 		}
 	}
-	reference.ordinal = reference.indexHigh = 0;
-	reference.indexLow = atrecords[1];
-	for (DWORD i = 1; i < inputlen; i++){
-		reference.indexLow = atrecords[i];
-		read = 8;
-		found = GetFileClusters(context[index], reference, &read, clusters);
-		found = 0;
-	}
 	wprintf(L"Press enter to exit");
 	ReadConsoleW(consoleIn, buffer, 4, &read, NULL);
 
 	VirtualFree(buffer, 0, MEM_RELEASE);
-	FreeConsole();
 	return 0;
 }
